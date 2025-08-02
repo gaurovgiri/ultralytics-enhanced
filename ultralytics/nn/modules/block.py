@@ -11,6 +11,7 @@ from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
+from torchvision.ops import drop_block
 
 __all__ = (
     "DFL",
@@ -52,7 +53,93 @@ __all__ = (
     "PSA",
     "SCDown",
     "TorchVision",
+    "EnhancedConv",
 )
+
+
+class ECA(nn.Module):
+    def __init__(self, channels, k_size=3):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=k_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        return x * y.expand_as(x)
+
+
+class SimAM(nn.Module):
+    def __init__(self, init_e_lambda=1e-4):
+        super().__init__()
+        self.e_lambda = nn.Parameter(torch.tensor(init_e_lambda))
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        n = w * h - 1
+        x_mean = x.mean(dim=[2, 3], keepdim=True)
+        x_var = (x - x_mean).pow(2).sum(dim=[2, 3], keepdim=True) / n
+        y = (x - x_mean).pow(2) / (4 * (x_var + self.e_lambda)) + 0.5
+        return x * y.sigmoid()
+
+
+class EnhancedConv(nn.Module):
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        e: float = 1.0,
+        k: int = 3,
+        s: int = 1,
+        p: Optional[int] = None,
+        act: nn.Module = nn.ReLU(),
+        drop_prob: float = 0.1,
+        use_eca: bool = True
+    ):
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = GhostConv(c1, 2 * c_, 1, 1)
+        
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                GhostConv(c_, c_, k, s, p),
+                nn.BatchNorm2d(c_),
+                act
+            ) for _ in range(n)
+        ])
+
+        self.use_eca = use_eca
+        if use_eca:
+            self.eca = ECA((2 + n) * c_)
+
+        self.cv2 = GhostConv((2 + n) * c_, c2, 1, 1)
+
+        self.drop = drop_block.DropBlock2d(block_size=3, p=drop_prob)
+        self.simam = SimAM()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.cv1(x)
+        x1, x2 = x.chunk(2, dim=1)
+        xs = [x1, x2]
+
+        for block in self.blocks:
+            out = block(xs[-1])
+            # Residual connection
+            out = out + xs[-1]
+            xs.append(out)
+
+        y = torch.cat(xs, dim=1)
+
+        if self.use_eca:
+            y = self.eca(y)
+
+        y = self.cv2(y)
+        y = self.drop(y)
+        y = self.simam(y)
+        return y
 
 
 class DFL(nn.Module):
